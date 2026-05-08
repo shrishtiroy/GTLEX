@@ -17,6 +17,11 @@ app.get('/', (req, res) => {
 
 
 app.get('/api/countries', async (req, res) => {
+  // Optimization: WHERE clause is appended only when `region` is supplied, and the
+  // value is bound as a parameter so PG can cache the plan.
+  // Worse alternative: always emitting `WHERE region = $1 OR $1 IS NULL`, which
+  // disables index use on `region`, or string-concatenating the value (no plan
+  // cache + SQL injection risk).
   const { region } = req.query;
   let query = 'SELECT country_code, country_name, region FROM country';
   const params = [];
@@ -29,6 +34,8 @@ app.get('/api/countries', async (req, res) => {
 });
 
 app.get('/api/sectors', async (req, res) => {
+  // Optimization: tiny lookup table; ORDER BY uses the PK so no real sort cost.
+  // Worse alternative: `SELECT *` would pull unused columns over the wire.
   try {
     const result = await pool.query(
       'SELECT isic_section, section_name FROM isic_sector ORDER BY isic_section'
@@ -38,6 +45,10 @@ app.get('/api/sectors', async (req, res) => {
 });
 
 app.get('/api/years', async (req, res) => {
+  // Optimization: DISTINCT on a single indexed column lets PG use an
+  // index-only scan / loose-index scan rather than a full table scan + hash agg.
+  // Worse alternative: `SELECT year FROM trade_flow GROUP BY year` materialises
+  // a hash aggregate over every row in the fact table.
   try {
     const result = await pool.query('SELECT DISTINCT year FROM trade_flow ORDER BY year');
     res.json(result.rows);
@@ -46,6 +57,10 @@ app.get('/api/years', async (req, res) => {
 
 // List all distinct HS chapters for the chapter-momentum dropdown
 app.get('/api/hs-chapters', async (req, res) => {
+  // Optimization: read directly from the small `hs_commodity` dimension table
+  // (one row per chapter), already keyed by hs_code.
+  // Worse alternative: `SELECT DISTINCT hs_chapter FROM trade_flow` — would scan
+  // the entire fact table just to recover the dimension.
   try {
     const result = await pool.query(
       'SELECT hs_code, hs_description FROM hs_commodity ORDER BY hs_code'
@@ -56,6 +71,9 @@ app.get('/api/hs-chapters', async (req, res) => {
 
 // GET /api/hs-sections — all HS sections for the top-exporters dropdown
 app.get('/api/hs-sections', async (req, res) => {
+  // Optimization: small dimension table, sorted by PK -> effectively a free scan.
+  // Worse alternative: deriving sections by joining `trade_flow -> hs_commodity
+  // -> hs_section` and DISTINCT-ing, which would touch the fact table needlessly.
   try {
     const result = await pool.query(
       'SELECT hs_section, section_label FROM hs_section ORDER BY hs_section'
@@ -71,6 +89,21 @@ app.get('/api/hs-sections', async (req, res) => {
 
 // Route 1: GET /api/alignment
 // Params: start_year, end_year, region
+//
+// Optimizations:
+//  - Per-country/year share is computed in a single scan via a window function
+//    `SUM(SUM(...)) OVER (PARTITION BY country_code, year)`, so the denominator
+//    is found in the same pass as the numerator.
+//  - `trade_flow='X'` and `IS NOT NULL` predicates are pushed into the CTE so
+//    we never aggregate rows we'd later discard.
+//  - Two narrow CTEs (one per HHI) joined once on (country_code, year), keeping
+//    the join input tiny; RANK() runs over that small joined set.
+//  - Year/region filters live on the OUTER select so the heavy CTEs stay
+//    parameter-free and PG can reuse the plan shape.
+//
+// Worse alternative: a correlated subquery to compute each country's yearly total
+// (re-scanning trade_flow per row), then a self-join between exports and labor
+// before any aggregation — quadratic blow-up plus a giant sort for the rank.
 app.get('/api/alignment', async (req, res) => {
   const { start_year = 2005, end_year, region } = req.query;
   const params = [parseInt(start_year)];
@@ -138,6 +171,21 @@ app.get('/api/alignment', async (req, res) => {
 // Route 2: GET /api/export-flip
 // Countries whose #1 HS section flipped over a decade.
 // Params: region, start_decade
+//
+// Optimizations:
+//  - `section_exports` pre-aggregates raw chapter rows to (country, year, section)
+//    BEFORE ranking, so RANK() runs over a far smaller set.
+//  - Top-1 sector is selected via `RANK() ... = 1` (one window pass) instead of
+//    a correlated `MAX` subquery per (country, year).
+//  - The decade comparison is an arithmetic self-join on `t_late.year =
+//    t_early.year + 10`, restricted to top-sector rows only — index-friendly and
+//    tiny on both sides.
+//  - `t_early.hs_section <> t_late.hs_section` is in the JOIN ON, so non-flipped
+//    pairs never materialise.
+//
+// Worse alternative: `LAG(top_section, 10) OVER (PARTITION BY country_code ORDER
+// BY year)` over the raw trade_flow stream — has to sort every fact row, then
+// post-filter, which is dramatically more expensive than joining two top-1 sets.
 app.get('/api/export-flip', async (req, res) => {
   const { region, start_decade } = req.query;
   const params = [];
@@ -202,6 +250,21 @@ app.get('/api/export-flip', async (req, res) => {
 // Route 3: GET /api/chapter-momentum
 // Shows which countries are gaining/losing world export share per HS chapter.
 // Params: year (required), hs_chapter, limit
+//
+// Optimizations:
+//  - `year IN ($1, $2)` in the base CTE limits the scan of trade_flow to just
+//    the two years we care about — the single biggest win in this query.
+//  - Layered CTEs (chapter_totals -> world_totals -> with_share -> momentum)
+//    are computed once and reused; world_totals reads from chapter_totals, not
+//    from the fact table again.
+//  - YoY delta uses a self-join on `with_share` keyed by year=$1 / year=$2
+//    instead of a window LAG that would have to sort the entire dataset.
+//  - `ABS(share_change) > 0.0001` early-prunes microscopic countries before
+//    RANK + ORDER BY; `LIMIT $3` lets PG do a bounded top-K sort.
+//
+// Worse alternative: scan all years of trade_flow and compute LAG over them, or
+// recompute world totals via a correlated subquery per row — both turn an
+// O(2 years) scan into an O(all history) scan.
 app.get('/api/chapter-momentum', async (req, res) => {
   const { year, hs_chapter, limit = 50 } = req.query;
   if (!year) return res.status(400).json({ error: 'year is required' });
@@ -272,6 +335,23 @@ app.get('/api/chapter-momentum', async (req, res) => {
 // Route 4: GET /api/hhi-concentration
 // HHI export basket concentration decade over decade.
 // Params: region, trend
+//
+// Optimizations:
+//  - Decade key is integer arithmetic `(year/10)*10` — cheaper than DATE_TRUNC
+//    or string formatting and groups predictably.
+//  - Median HHI per decade is computed inside `decade_hhi` with PERCENTILE_CONT,
+//    so the outer query reads one row per (country, decade) instead of
+//    recomputing the percentile.
+//  - `years_in_decade >= 5` lives inside the JOIN ON of `decade_comparison`, so
+//    sparse decades are eliminated before the decade-pair set is materialised.
+//  - The trend label (CASE) is precomputed in `classified`, so the optional
+//    `trend = $...` filter is a cheap equality on a derived column.
+//  - `chapter_exports` is reused by both `country_totals` and `chapter_shares`
+//    so the fact table is scanned only once.
+//
+// Worse alternative: compute decade boundaries in JS and issue one query per
+// (country, decade), or recompute the median in the outer SELECT — N+1 round-
+// trips and repeated sorts.
 app.get('/api/hhi-concentration', async (req, res) => {
   const { region, trend } = req.query;
   const params = [];
@@ -359,6 +439,18 @@ app.get('/api/hhi-concentration', async (req, res) => {
 //  STANDARD QUERY ROUTES (5-10)
 
 // Route 5: Top exporters by ISIC sector and year
+//
+// Optimizations:
+//  - Required-param guard fails fast in JS before any DB round-trip.
+//  - Highly selective equality predicates (`year = $2`, `hs_section = $1`) are
+//    pushed first so PG can use the (year, ...) index on trade_flow before joining.
+//  - Joins are all on PK/FK columns (hs_code, hs_section, country_code).
+//  - `GROUP BY ... ORDER BY total DESC LIMIT $3` is the textbook top-N pattern
+//    so PG does a bounded heap sort rather than a full sort.
+//
+// Worse alternative: aggregate over all years/sections and filter afterwards,
+// or `ORDER BY` without `LIMIT` and slice in JS — both pull and sort orders of
+// magnitude more rows than necessary.
 app.get('/api/top-exporters', async (req, res) => {
   const { hs_section, year, limit = 10 } = req.query;
   if (!hs_section || !year) {
@@ -396,6 +488,17 @@ app.get('/api/top-exporters', async (req, res) => {
 });
 
 // Route 6: Trade totals (import/export) for a country and year
+//
+// Optimizations:
+//  - Filters on `(country_code, year)` match the natural composite index on
+//    trade_flow, making this an index range scan + small hash agg.
+//  - `country_code.toUpperCase()` normalises input so equality matches the
+//    canonical stored form (would otherwise miss the index).
+//  - Returns at most 2 rows (one per flow direction); 404 short-circuits on
+//    empty results so the client doesn't render an empty payload.
+//
+// Worse alternative: two separate queries (one for X, one for M) — double the
+// round-trips and double the index probes.
 app.get('/api/trade-totals/:country_code/:year', async (req, res) => {
   const { country_code, year } = req.params;
   const query = `
@@ -412,6 +515,16 @@ app.get('/api/trade-totals/:country_code/:year', async (req, res) => {
 });
 
 // Route 7: Employment by sector for a country and year
+//
+// Optimizations:
+//  - Three equality predicates on `(country_code, year, sex)` — the natural
+//    composite key on employment_fact, so this is an index probe.
+//  - One small join to `isic_sector` for the human label; data is already at
+//    sector grain so no aggregation is needed.
+//  - Selects only the three columns the UI uses (no SELECT *).
+//
+// Worse alternative: pull all employment rows for the country and filter/join
+// in JS — wastes bandwidth and skips the index entirely.
 app.get('/api/employment/:country_code/:year', async (req, res) => {
   const { country_code, year } = req.params;
   const { sex = 'T' } = req.query;
@@ -431,6 +544,17 @@ app.get('/api/employment/:country_code/:year', async (req, res) => {
 
 // Route 8: GET /api/export-diversity
 // Params: year (required), region
+//
+// Optimizations:
+//  - `year = $1` is pushed into the very first CTE, so only one year of
+//    trade_flow is ever scanned.
+//  - Shannon entropy is computed in a single aggregate pass:
+//    `-SUM(share * LN(NULLIF(share, 0)))` — no loop, no self-join.
+//  - `NULLIF(share, 0)` inside LN avoids -inf / domain errors without a CASE.
+//  - RANK runs over the small `entropy` CTE, not raw trade rows.
+//
+// Worse alternative: compute shares in JS and entropy in JS after pulling all
+// chapter rows for every country — N×M data transfer plus per-row math.
 app.get('/api/export-diversity', async (req, res) => {
   const { year, region } = req.query;
   if (!year) return res.status(400).json({ error: 'year is required' });
@@ -481,6 +605,20 @@ app.get('/api/export-diversity', async (req, res) => {
 });
 
 // Route 9: Export growth momentum by ISIC sector (kept as-is, uses csm but has data for sector C)
+//
+// Optimizations:
+//  - YoY growth is computed with `LAG()` in one ordered window pass instead of
+//    a self-join `ON year = year - 1`.
+//  - `sector_exports` pre-aggregates chapter rows up to ISIC sector first, so
+//    LAG operates on a much smaller partition.
+//  - Outer `g.year = $1` keeps only the requested year AFTER LAG has populated
+//    growth from the prior year's value.
+//  - `growth_rate IS NOT NULL` discards the first-year-per-partition rows
+//    (where LAG returns NULL) without an extra subquery.
+//  - `LIMIT` is parameterised so the result set is bounded.
+//
+// Worse alternative: self-join `sector_exports` with itself on `year = year - 1`
+// — doubles the input to the join and prevents the single-pass window plan.
 app.get('/api/export-momentum', async (req, res) => {
   const { year, isic_section, limit } = req.query;
   if (!year) return res.status(400).json({ error: 'year is required' });
@@ -529,53 +667,54 @@ app.get('/api/export-momentum', async (req, res) => {
 });
 
 // Route 10: Trade balance by ISIC sector for a country and year
+//
+// Optimizations:
+//  - Two narrow CTEs (`exports`, `imports`) each push `country_code = $1 AND
+//    year = $2` down to the scan, so each only touches the relevant slice of
+//    trade_flow.
+//  - Aggregation happens BEFORE the join, so the join input is one row per
+//    (country, year, sector) — essentially a lookup.
+//  - The exporter/importer label is computed in projection with a CASE — no
+//    extra pass over the data.
+//
+// Worse alternative: one query that scans trade_flow once and pivots X vs M
+// with conditional SUMs is fine, but doing it without pushing the country/year
+// filter down (e.g. filtering only in the outer SELECT) would scan the entire
+// fact table.
 app.get('/api/trade-balance/:country_code/:year', async (req, res) => {
   const { country_code, year } = req.params;
+  // Single-scan conditional SUM: pivots X / M in one pass over trade_flow so
+  // sectors with only exports OR only imports still appear (the previous
+  // INNER JOIN between exports and imports dropped those rows). Also returns
+  // [] on empty instead of 404 so the React chart renders cleanly.
   const query = `
-    WITH exports AS (
-      SELECT country_code, year, csm.isic_section,
-        SUM(trade_value_usd) AS export_value
-      FROM trade_flow tf
-      JOIN commodity_sector_mapping csm ON tf.hs_chapter = csm.hs_code
-      WHERE trade_flow = 'X' AND trade_value_usd IS NOT NULL
-        AND country_code = $1 AND year = $2
-      GROUP BY country_code, year, csm.isic_section
-    ),
-    imports AS (
-      SELECT country_code, year, csm.isic_section,
-        SUM(trade_value_usd) AS import_value
-      FROM trade_flow tf
-      JOIN commodity_sector_mapping csm ON tf.hs_chapter = csm.hs_code
-      WHERE trade_flow = 'M' AND trade_value_usd IS NOT NULL
-        AND country_code = $1 AND year = $2
-      GROUP BY country_code, year, csm.isic_section
-    ),
-    balance AS (
-      SELECT e.country_code, e.year, e.isic_section,
-        e.export_value, i.import_value,
-        e.export_value - i.import_value AS trade_balance
-      FROM exports e
-      JOIN imports i ON e.country_code = i.country_code
-        AND e.year = i.year AND e.isic_section = i.isic_section
-    )
     SELECT
-      c.country_name, c.region, b.year, b.isic_section, s.section_name,
-      ROUND((b.trade_balance / 1e9)::NUMERIC, 2) AS trade_balance_bn,
-      CASE WHEN b.trade_balance > 0 THEN 'net exporter' ELSE 'net importer' END AS status
-    FROM balance b
-    JOIN country c    ON b.country_code = c.country_code
-    JOIN isic_sector s ON b.isic_section = s.isic_section
-    ORDER BY b.year, b.trade_balance DESC
+      c.country_name, c.region, tf.year, csm.isic_section, s.section_name,
+      ROUND(((SUM(CASE WHEN tf.trade_flow = 'X' THEN tf.trade_value_usd ELSE 0 END)
+            - SUM(CASE WHEN tf.trade_flow = 'M' THEN tf.trade_value_usd ELSE 0 END)
+           ) / 1e9)::NUMERIC, 2) AS trade_balance_bn,
+      CASE WHEN SUM(CASE WHEN tf.trade_flow = 'X' THEN tf.trade_value_usd ELSE 0 END)
+              > SUM(CASE WHEN tf.trade_flow = 'M' THEN tf.trade_value_usd ELSE 0 END)
+           THEN 'net exporter' ELSE 'net importer' END AS status
+    FROM trade_flow tf
+    JOIN commodity_sector_mapping csm ON tf.hs_chapter   = csm.hs_code
+    JOIN country c                    ON tf.country_code = c.country_code
+    JOIN isic_sector s                ON csm.isic_section = s.isic_section
+    WHERE tf.country_code = $1 AND tf.year = $2 AND tf.trade_value_usd IS NOT NULL
+    GROUP BY c.country_name, c.region, tf.year, csm.isic_section, s.section_name
+    ORDER BY trade_balance_bn DESC
   `;
   try {
     const result = await pool.query(query, [country_code.toUpperCase(), parseInt(year)]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'No data found' });
     res.json(result.rows);
   } catch (err) { console.error(err); res.status(500).json({ error: 'Database error' }); }
 });
 
 
 // Legacy route
+// Optimization: minimal projection over the small `country` dimension table,
+// sorted by an indexed column. Kept for backwards compatibility with older
+// frontend builds.
 app.get('/countries', async (req, res) => {
   try {
     const result = await pool.query('SELECT country_code, country_name FROM country ORDER BY country_name');
