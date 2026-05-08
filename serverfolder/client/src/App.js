@@ -255,9 +255,7 @@ function DataTable({ columns, rows, keyField }) {
   );
 }
 
-// ─────────────────────────────────────────────
 //  Hooks
-// ─────────────────────────────────────────────
 function useFetch(url) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -322,20 +320,19 @@ function HomePage() {
   const [year, setYear] = useState('2015');
   const { data: topExp, loading: topLoading, error: topErr, run: runTop } = useManualFetch();
 
-  // Pass sec explicitly so we never read stale state
-  const fetchTop = (sec = sector) => {
-    if (!sec) return;
-    runTop(`/api/top-exporters?hs_section=${sec}&year=${year}&limit=10`);
-  };
-
-  // When hsSections loads: set sector AND fetch in one shot using the raw value
+  // Set default sector to first available once hsSections loads
   useEffect(() => {
-    if (hsSections && hsSections.length > 0) {
-      const first = String(hsSections[0].hs_section);
-      setSector(first);
-      runTop(`/api/top-exporters?hs_section=${first}&year=2015&limit=10`);
+    if (hsSections && hsSections.length > 0 && !sector) {
+      setSector(String(hsSections[0].hs_section));
     }
   }, [hsSections]); // eslint-disable-line
+
+  // Only fetch once we have a valid sector value
+  useEffect(() => {
+    if (hsSections && hsSections.length > 0 && sector) fetchTop();
+  }, [hsSections]); // eslint-disable-line
+
+  const fetchTop = () => runTop(`/api/top-exporters?hs_section=${sector}&year=${year}&limit=10`);
 
   return (
     <div style={styles.page}>
@@ -355,14 +352,9 @@ function HomePage() {
         <h2 style={styles.h2}>Top Exporters by Sector</h2>
         <div style={styles.controls}>
           <FieldGroup label="HS Section">
-            <select
-              style={styles.select}
-              value={sector}
-              onChange={e => setSector(e.target.value)}
-            >
-              {!hsSections && <option value="">Loading…</option>}
+            <select style={styles.select} value={sector} onChange={e => setSector(e.target.value)}>
               {(hsSections || []).map(s => (
-                <option key={s.hs_section} value={String(s.hs_section)}>
+                <option key={s.hs_section} value={s.hs_section}>
                   {s.hs_section} — {s.section_label?.slice(0, 35)}
                 </option>
               ))}
@@ -373,18 +365,23 @@ function HomePage() {
               onChange={e => setYear(e.target.value)} />
           </FieldGroup>
           <div style={{ paddingBottom: 0 }}>
-            <button style={styles.btn} onClick={() => fetchTop()}>Query</button>
+            <button style={styles.btn} onClick={fetchTop}>Query</button>
           </div>
         </div>
         {topLoading && <Spinner />}
         {topErr && <ErrorMsg msg={topErr} />}
-        {topExp && topExp.length > 0 && (
-          <ResponsiveContainer width="100%" height={280}>
-            <BarChart data={topExp} layout="vertical" margin={{ left: 20, right: 20 }}>
+        {topExp && (() => {
+          const topExpMax = Math.max(...topExp.map(r => Number(r.total_export_value) || 0));
+          return (
+          <ResponsiveContainer width="100%" height={topExp.length * 42 + 40}>
+            <BarChart data={topExp} layout="vertical" margin={{ left: 0, right: 60, top: 4, bottom: 4 }}>
               <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
               <XAxis type="number" tick={{ fill: C.muted, fontSize: 11 }}
-                tickFormatter={v => `$${(v / 1e9).toFixed(1)}B`} />
-              <YAxis type="category" dataKey="country_name" tick={{ fill: C.text, fontSize: 11 }} width={110} />
+                tickFormatter={v => `$${(v / 1e9).toFixed(1)}B`}
+                domain={[0, Math.ceil(topExpMax * 1.15)]} />
+              <YAxis type="category" dataKey="country_name"
+                tick={{ fill: C.text, fontSize: 11 }} width={120}
+                tickFormatter={v => v.length > 14 ? v.slice(0, 13) + '…' : v} />
               <Tooltip
                 contentStyle={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6 }}
                 formatter={v => [`$${(v / 1e9).toFixed(2)}B`, 'Export Value']}
@@ -396,8 +393,8 @@ function HomePage() {
               </Bar>
             </BarChart>
           </ResponsiveContainer>
-        )}
-        {topExp && topExp.length === 0 && <Empty />}
+          );
+        })()}
       </div>
 
       <div style={{ ...styles.card, background: C.accentSoft, border: `1px solid ${C.accent}33` }}>
@@ -406,7 +403,7 @@ function HomePage() {
           {[
             { title: 'Trade vs. Employment', desc: 'Compare trade volume and workforce size by sector for any country.' },
             { title: 'Top Trading Partners', desc: 'Rank import/export partners for a selected country and year.' },
-            { title: 'Export Composition Over Time', desc: "Track how a country's export mix evolves year by year." },
+            { title: 'Export Composition Over Time', desc: 'Track how a country\'s export mix evolves year by year.' },
             { title: 'Workforce & Trade Specialization', desc: 'Explore alignment between labor structure and export profile.' },
           ].map(p => (
             <div key={p.title} style={{ padding: '14px 16px', background: C.surface, borderRadius: 6, border: `1px solid ${C.border}` }}>
@@ -492,13 +489,18 @@ function TradeEmploymentPage() {
         <h2 style={styles.h2}>Employment by ISIC Sector (thousands)</h2>
         {empLoading && <Spinner />}
         {empErr && <ErrorMsg msg={empErr} />}
-        {empData && empData.length > 0 && (
-          <ResponsiveContainer width="100%" height={320}>
-            <BarChart data={empData} layout="vertical" margin={{ left: 10, right: 30 }}>
+        {empData && empData.length > 0 && (() => {
+          const empMax = Math.max(...empData.map(r => Number(r.employment_thousands) || 0));
+          return (
+          <ResponsiveContainer width="100%" height={empData.length * 38 + 40}>
+            <BarChart data={empData} layout="vertical" margin={{ left: 0, right: 60, top: 4, bottom: 4 }}>
               <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
               <XAxis type="number" tick={{ fill: C.muted, fontSize: 11 }}
-                tickFormatter={v => v >= 1000 ? `${(v / 1000).toFixed(0)}M` : v} />
-              <YAxis type="category" dataKey="section_name" tick={{ fill: C.text, fontSize: 11 }} width={140} />
+                tickFormatter={v => v >= 1000 ? `${(v / 1000).toFixed(0)}M` : v}
+                domain={[0, Math.ceil(empMax * 1.15)]} />
+              <YAxis type="category" dataKey="section_name"
+                tick={{ fill: C.text, fontSize: 10 }} width={200}
+                tickFormatter={v => v.length > 28 ? v.slice(0, 27) + '…' : v} />
               <Tooltip
                 contentStyle={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6 }}
                 formatter={v => [`${Number(v).toLocaleString()}k`, 'Employed']}
@@ -506,7 +508,8 @@ function TradeEmploymentPage() {
               <Bar dataKey="employment_thousands" fill={C.accent} radius={[0, 4, 4, 0]} />
             </BarChart>
           </ResponsiveContainer>
-        )}
+          );
+        })()}
         {empData && empData.length === 0 && <Empty />}
       </div>
 
@@ -717,12 +720,17 @@ function ExportCompositionPage() {
         </p>
         {divLoading && <Spinner />}
         {divErr && <ErrorMsg msg={divErr} />}
-        {divChart.length > 0 && (
-          <ResponsiveContainer width="100%" height={300}>
-            <BarChart data={divChart} layout="vertical" margin={{ left: 10, right: 20 }}>
+        {divChart.length > 0 && (() => {
+          const divMax = Math.max(...divChart.map(r => Number(r.entropy) || 0));
+          return (
+          <ResponsiveContainer width="100%" height={divChart.length * 36 + 40}>
+            <BarChart data={divChart} layout="vertical" margin={{ left: 0, right: 60, top: 4, bottom: 4 }}>
               <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
-              <XAxis type="number" tick={{ fill: C.muted, fontSize: 11 }} />
-              <YAxis type="category" dataKey="name" tick={{ fill: C.text, fontSize: 11 }} width={100} />
+              <XAxis type="number" tick={{ fill: C.muted, fontSize: 11 }}
+                domain={[0, Math.ceil(divMax * 1.15 * 10) / 10]} />
+              <YAxis type="category" dataKey="name"
+                tick={{ fill: C.text, fontSize: 11 }} width={130}
+                tickFormatter={v => v.length > 16 ? v.slice(0, 15) + '…' : v} />
               <Tooltip
                 contentStyle={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6 }}
                 formatter={v => [Number(v).toFixed(4), 'Shannon Entropy']}
@@ -730,7 +738,8 @@ function ExportCompositionPage() {
               <Bar dataKey="entropy" fill={C.purple} radius={[0, 4, 4, 0]} />
             </BarChart>
           </ResponsiveContainer>
-        )}
+          );
+        })()}
         {!divLoading && divChart.length === 0 && <Empty />}
       </div>
 
@@ -887,14 +896,19 @@ function SpecializationPage() {
         </p>
         {alignLoading && <Spinner />}
         {alignErr && <ErrorMsg msg={alignErr} />}
-        {alignChart.length > 0 && (
+        {alignChart.length > 0 && (() => {
+          const alignMax = Math.max(...alignChart.flatMap(r => [Number(r.export_hhi) || 0, Number(r.labor_hhi) || 0]));
+          return (
           <>
-            <ResponsiveContainer width="100%" height={320}>
-              <BarChart data={alignChart} layout="vertical" margin={{ left: 10, right: 30 }}>
+            <ResponsiveContainer width="100%" height={alignChart.length * 38 + 60}>
+              <BarChart data={alignChart} layout="vertical" margin={{ left: 0, right: 60, top: 4, bottom: 4 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
                 <XAxis type="number" tick={{ fill: C.muted, fontSize: 11 }}
-                  tickFormatter={v => v.toFixed(3)} />
-                <YAxis type="category" dataKey="name" tick={{ fill: C.text, fontSize: 10 }} width={130} />
+                  tickFormatter={v => v.toFixed(3)}
+                  domain={[0, Math.ceil(alignMax * 1.2 * 100) / 100]} />
+                <YAxis type="category" dataKey="name"
+                  tick={{ fill: C.text, fontSize: 10 }} width={155}
+                  tickFormatter={v => v.length > 20 ? v.slice(0, 19) + '…' : v} />
                 <Tooltip
                   contentStyle={{ background: C.surface, border: '1px solid ' + C.border, borderRadius: 6 }}
                   formatter={(v, name) => [
@@ -926,7 +940,8 @@ function SpecializationPage() {
               />
             </div>
           </>
-        )}
+          );
+        })()}
         {!alignLoading && alignChart.length === 0 && <Empty />}
       </div>
 
