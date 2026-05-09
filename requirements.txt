@@ -1,0 +1,6 @@
+# Python dependencies for data_preprocessing.ipynb
+# Install with: pip install -r requirements.txt
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+jupyter>=1.0
