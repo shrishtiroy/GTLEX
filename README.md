@@ -2,7 +2,7 @@
 
 GTLEX is an interactive web application that combines international trade data (UN Comtrade) with labor market data (ILOSTAT) so users can explore how export structure, trade value, and employment composition relate across countries and over time. The application centers on questions that are difficult to answer when trade and labor datasets remain separate: whether manufacturing-heavy labor markets correspond to manufactured exports, which countries dominate specific commodity categories, and which countries structurally transformed their export baskets over a decade.
 
-CIS 5500 Final Project — Shrishti Roy, Alex Kim, Mel Han, Joshua Ahn.
+
 
 ## Repository structure
 
